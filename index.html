@@ -49,7 +49,7 @@ const PHYS = {
   K: 0.70,       // 速度比例抗力
   C: 60,         // 一定摩擦(これ未満の推力では動かない = 小声の死に領域)
   GAMMA: 2.4,    // 開度→推力の非線形指数
-  ALAT: 700,     // 最大横加速度(速いほど曲がれない)
+  ALAT: 520,     // 最大横加速度(速いほど曲がれない)
   OMEGA_MAX: 3.3,
   CAR_R: 11,
   HIT: 0.30,     // 壁接触時の速度倍率
@@ -234,13 +234,13 @@ function runLap(policy, opts){
 function policyConstant(q){ return function(){ return q; }; }
 function policyModulated(){
   return function(s){
-    for (let dd=0; dd<=1000; dd+=20){
+    for (let dd=0; dd<=1200; dd+=20){
       const i=(s.idx+Math.round(dd/SPACING))%N;
-      if (s.v > VLIM[i] || brakeDist(s.v, VLIM[i]) + 30 >= dd) {
-        if (s.v > VLIM[i]*0.98) return 0;      // 曲がれない → 黙る
-      }
+      const vl=VLIM[i];
+      // 「いま黙り始めないと、そのコーナーまでに落としきれない」ときだけ黙る
+      if (s.v > vl && brakeDist(s.v, vl) + 25 >= dd) return 0;
     }
-    return 1;                                   // 曲がれる → 吐ききる
+    return 1;                                   // 曲がりきれる → 吐ききる
   };
 }
 
