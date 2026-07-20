@@ -1,0 +1,785 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>息継ぎのコーナー</title>
+<style>
+  html,body{margin:0;height:100%;background:#15100c;color:#f2e6d2;
+    font-family:"Hiragino Kaku Gothic ProN","Noto Sans JP",system-ui,sans-serif;overflow:hidden}
+  #wrap{position:relative;width:100vw;height:100vh;display:flex;align-items:center;justify-content:center}
+  canvas{max-width:100%;max-height:100%;image-rendering:auto;box-shadow:0 0 60px #000a}
+  #ui{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    pointer-events:none}
+  .panel{pointer-events:auto;background:#1c1611ee;border:1px solid #6b563a;border-radius:14px;
+    padding:28px 34px;max-width:560px;text-align:center;box-shadow:0 18px 60px #000b}
+  .panel h1{margin:0 0 6px;font-size:25px;letter-spacing:.04em}
+  .panel .sub{color:#c2a87e;font-size:13px;margin-bottom:16px}
+  .panel p{font-size:14px;line-height:1.75;color:#ddcfb6;margin:10px 0}
+  button{pointer-events:auto;font:inherit;font-size:15px;padding:11px 26px;margin:6px 5px 0;
+    border-radius:9px;border:1px solid #b58b4a;background:#3a2c1a;color:#ffe9c4;cursor:pointer}
+  button:hover{background:#4d3a22}
+  button.ghost{border-color:#5a4a34;background:transparent;color:#b09a78;font-size:13px;padding:9px 18px}
+  .big{font-size:52px;font-weight:700;margin:14px 0 4px;letter-spacing:.02em}
+  .meter{height:12px;background:#0e0a07;border-radius:6px;overflow:hidden;margin:14px 0 4px;
+    border:1px solid #4a3c2a}
+  .meter i{display:block;height:100%;width:0%;background:linear-gradient(90deg,#6fae5a,#e8c34a,#e2643c)}
+  .warn{background:#4a1f14;border:1px solid #c25a34;color:#ffcdb8;font-size:12.5px;
+    padding:9px 13px;border-radius:8px;margin-top:14px;line-height:1.6}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv" width="1400" height="980"></canvas>
+  <div id="ui"></div>
+</div>
+<script>
+"use strict";
+
+/* ============================================================
+   息継ぎのコーナー — ブレーキは黙ることだけ
+   ・声の RMS をキャリブレーション値で 0..1 に正規化 → スロットル開度
+   ・減速手段は「黙る」ことだけ(惰性 + 抗力)。ブレーキ入力は存在しない
+   ・速度は開度に対して非線形。小声の巡航は本当に遅い
+   ============================================================ */
+
+/* ---------- 物理定数 ---------- */
+const PHYS = {
+  A: 354,        // 推力係数  (開度^GAMMA に掛かる)
+  K: 0.70,       // 速度比例抗力
+  C: 60,         // 一定摩擦(これ未満の推力では動かない = 小声の死に領域)
+  GAMMA: 2.4,    // 開度→推力の非線形指数
+  ALAT: 700,     // 最大横加速度(速いほど曲がれない)
+  OMEGA_MAX: 3.3,
+  CAR_R: 11,
+  HIT: 0.30,     // 壁接触時の速度倍率
+};
+// 終端速度 v(t) = (A*t^GAMMA - C)/K   →  v(1)=420, v(0.7)=127, v(0.5)=10
+function terminalSpeed(t){ return Math.max(0,(PHYS.A*Math.pow(t,PHYS.GAMMA)-PHYS.C)/PHYS.K); }
+const VMAX = terminalSpeed(1);
+
+/* ---------- コース ---------- */
+const HALFW = 46;                    // 走行可能半幅(中心線からの距離)
+const WAYPOINTS = [
+  [170,830],[1230,830],[1230,610],[770,610],[770,390],[1230,390],[1230,175],[170,175]
+];
+const RADII = [78,78,78,62,62,78,78,78];
+const SPACING = 5;                   // 中心線サンプル間隔(px)
+
+function buildCenterline(pts, radii){
+  const n = pts.length, arcs = [];
+  for (let i=0;i<n;i++){
+    const A=pts[(i-1+n)%n], B=pts[i], C=pts[(i+1)%n];
+    let ux=B[0]-A[0], uy=B[1]-A[1]; const lu=Math.hypot(ux,uy); ux/=lu; uy/=lu;
+    let vx=C[0]-B[0], vy=C[1]-B[1]; const lv=Math.hypot(vx,vy); vx/=lv; vy/=lv;
+    const cross=ux*vy-uy*vx, dot=ux*vx+uy*vy;
+    const theta=Math.atan2(Math.abs(cross),dot);
+    const r=radii[i], d=r*Math.tan(theta/2);
+    const sx=B[0]-ux*d, sy=B[1]-uy*d;
+    const ex=B[0]+vx*d, ey=B[1]+vy*d;
+    const sgn=Math.sign(cross)||1;
+    const nx=-uy*sgn, ny=ux*sgn;               // 中心方向の法線
+    const cx=sx+nx*r, cy=sy+ny*r;
+    arcs.push({sx,sy,ex,ey,cx,cy,r,sgn,theta,
+               a0:Math.atan2(sy-cy,sx-cx)});
+  }
+  const out=[];
+  for (let i=0;i<n;i++){
+    const a=arcs[i];
+    const steps=Math.max(2,Math.ceil(a.r*a.theta/SPACING));
+    for (let j=0;j<steps;j++){
+      const ang=a.a0+a.sgn*a.theta*(j/steps);
+      out.push([a.cx+Math.cos(ang)*a.r, a.cy+Math.sin(ang)*a.r]);
+    }
+    const b=arcs[(i+1)%n];
+    const dx=b.sx-a.ex, dy=b.sy-a.ey, L=Math.hypot(dx,dy);
+    const st=Math.max(1,Math.ceil(L/SPACING));
+    for (let j=0;j<st;j++) out.push([a.ex+dx*(j/st), a.ey+dy*(j/st)]);
+  }
+  return out;
+}
+
+let CL = buildCenterline(WAYPOINTS, RADII);
+// スタートラインが配列先頭に来るよう回転(下側の直線 x≈420)
+(function rotateToStart(){
+  let bi=0,bd=1e9;
+  for (let i=0;i<CL.length;i++){
+    const d=Math.hypot(CL[i][0]-420, CL[i][1]-830);
+    if(d<bd){bd=d;bi=i;}
+  }
+  CL = CL.slice(bi).concat(CL.slice(0,bi));
+})();
+const N = CL.length;
+
+// 曲率(Menger)。span 3 サンプル ≒ 15px
+const CURV = (function(){
+  const out=new Float64Array(N), sp=3;
+  for (let i=0;i<N;i++){
+    const a=CL[(i-sp+N)%N], b=CL[i], c=CL[(i+sp)%N];
+    const ab=Math.hypot(b[0]-a[0],b[1]-a[1]);
+    const bc=Math.hypot(c[0]-b[0],c[1]-b[1]);
+    const ca=Math.hypot(a[0]-c[0],a[1]-c[1]);
+    const ar=Math.abs((b[0]-a[0])*(c[1]-a[1])-(c[0]-a[0])*(b[1]-a[1]))/2;
+    out[i]= (ab*bc*ca) ? 4*ar/(ab*bc*ca) : 0;
+  }
+  return out;
+})();
+
+// 各サンプル地点の「曲がれる上限速度」。コース幅ぶんだけ半径を稼げる分を加味
+const VLIM = (function(){
+  const out=new Float64Array(N);
+  for (let i=0;i<N;i++){
+    const k=CURV[i];
+    if (k < 1e-4) { out[i]=VMAX*2; continue; }
+    const rEff = 1/k + HALFW*0.75;                  // イン・アウトを使った実効半径
+    out[i]=Math.min(VMAX*2, Math.sqrt(PHYS.ALAT*rEff));
+  }
+  // 前後に最小値を少し滲ませる(コーナー入口の判定を素直にする)
+  const sm=new Float64Array(N);
+  for (let i=0;i<N;i++){
+    let m=out[i];
+    for(let j=-4;j<=4;j++) m=Math.min(m,out[(i+j+N)%N]);
+    sm[i]=m;
+  }
+  return sm;
+})();
+
+/* ---------- コース上の最近傍 ---------- */
+function nearest(x,y){
+  let best=1e18,bi=0,bpx=0,bpy=0;
+  for (let i=0;i<N;i++){
+    const a=CL[i], b=CL[(i+1)%N];
+    const dx=b[0]-a[0], dy=b[1]-a[1];
+    const L2=dx*dx+dy*dy;
+    let t=L2 ? ((x-a[0])*dx+(y-a[1])*dy)/L2 : 0;
+    t=t<0?0:t>1?1:t;
+    const px=a[0]+dx*t, py=a[1]+dy*t;
+    const d=(x-px)*(x-px)+(y-py)*(y-py);
+    if(d<best){best=d;bi=i;bpx=px;bpy=py;}
+  }
+  return {d:Math.sqrt(best), i:bi, px:bpx, py:bpy};
+}
+
+/* ---------- 車体ステップ(実走とシミュで共有) ---------- */
+function stepCar(s, throttle, steer, dt){
+  const thrust = PHYS.A*Math.pow(Math.max(0,throttle), PHYS.GAMMA);
+  const drag = PHYS.K*s.v + (s.v>0.5 ? PHYS.C : 0);
+  let v = s.v + (thrust-drag)*dt;
+  if (v<0) v=0;
+  const omega = v>1 ? Math.min(PHYS.OMEGA_MAX, PHYS.ALAT/v) : PHYS.OMEGA_MAX;
+  s.heading += steer*omega*dt;
+  s.v = v;
+  s.x += Math.cos(s.heading)*v*dt;
+  s.y += Math.sin(s.heading)*v*dt;
+
+  // 壁 —— 中心線からの距離で判定(描画の帯と厳密に一致する)
+  const nr = nearest(s.x, s.y);
+  const lim = HALFW - PHYS.CAR_R;
+  s.hit = false;
+  if (nr.d > lim){
+    const ux=(s.x-nr.px)/(nr.d||1), uy=(s.y-nr.py)/(nr.d||1);
+    s.x = nr.px+ux*lim; s.y = nr.py+uy*lim;
+    s.v *= PHYS.HIT;
+    s.hit = true; s.hitX=nr.px+ux*HALFW; s.hitY=nr.py+uy*HALFW;
+  }
+  // 周回進捗(インデックス差の累積。逆走すると減る)
+  let d = nr.i - s.lastIdx;
+  if (d >  N/2) d -= N;
+  if (d < -N/2) d += N;
+  s.prog += d; s.lastIdx = nr.i; s.idx = nr.i;
+  return s;
+}
+
+function newCar(){
+  const h = Math.atan2(CL[3][1]-CL[0][1], CL[3][0]-CL[0][0]);
+  return {x:CL[0][0], y:CL[0][1], heading:h, v:0, prog:0, lastIdx:0, idx:0, hit:false};
+}
+
+/* ============================================================
+   シミュレーション(合格条件5の検証用 / window.__sim)
+   実走と同じ stepCar・同じコース・同じ操舵AIで、
+   スロットル方針だけを差し替えて比較する
+   ============================================================ */
+function brakeDist(v, vt){
+  let d=0,s=v; const dt=0.02;
+  while (s>vt && d<4000){ s += -(PHYS.K*s+PHYS.C)*dt; if(s<0)s=0; d += s*dt; }
+  return d;
+}
+function angDiff(a,b){ let d=a-b; while(d>Math.PI)d-=2*Math.PI; while(d<-Math.PI)d+=2*Math.PI; return d; }
+
+function runLap(policy, opts){
+  opts = opts||{};
+  const REACT = opts.react!==undefined ? opts.react : 0.14;   // 操舵の反応遅れ(秒)
+  const dt = 1/120, s = newCar();
+  const queue = []; const qlen = Math.max(1,Math.round(REACT/dt));
+  let t=0, hits=0, maxT=180;
+  while (s.prog < N && t < maxT){
+    // --- 操舵AI: 速度に応じた先読み点へ向く ---
+    const look = 45 + s.v*0.30;
+    const tgt = CL[(s.idx + Math.round(look/SPACING)) % N];
+    const want = Math.atan2(tgt[1]-s.y, tgt[0]-s.x);
+    let st = angDiff(want, s.heading)*4.0;
+    st = st<-1?-1:st>1?1:st;
+    queue.push(st); if(queue.length>qlen) queue.shift();
+    const steer = queue[0];
+    // --- スロットル方針 ---
+    const th = policy(s);
+    stepCar(s, th, steer, dt);
+    if (s.hit) hits++;
+    t += dt;
+  }
+  return {time: s.prog>=N ? t : null, hits, finished: s.prog>=N};
+}
+
+function policyConstant(q){ return function(){ return q; }; }
+function policyModulated(){
+  return function(s){
+    for (let dd=0; dd<=1000; dd+=20){
+      const i=(s.idx+Math.round(dd/SPACING))%N;
+      if (s.v > VLIM[i] || brakeDist(s.v, VLIM[i]) + 30 >= dd) {
+        if (s.v > VLIM[i]*0.98) return 0;      // 曲がれない → 黙る
+      }
+    }
+    return 1;                                   // 曲がれる → 吐ききる
+  };
+}
+
+window.__sim = function(){
+  const out = {constant:[], best:null, modulated:null};
+  for (let q=0.50; q<=1.0001; q+=0.02){
+    const r = runLap(policyConstant(q));
+    out.constant.push({q:+q.toFixed(2), time:r.time, hits:r.hits});
+    if (r.time && (!out.best || r.time < out.best.time)) out.best={q:+q.toFixed(2), time:r.time, hits:r.hits};
+  }
+  const m = runLap(policyModulated());
+  out.modulated = {time:m.time, hits:m.hits};
+  out.vmax = VMAX;
+  out.vlimMin = Math.min.apply(null, Array.from(VLIM));
+  out.lapLen = N*SPACING;
+  return out;
+};
+
+/* ============================================================
+   入力: マイク(RMS) / スペースキー フォールバック
+   ============================================================ */
+const mic = {
+  ok:false, ctx:null, analyser:null, buf:null,
+  rms:0, floor:0.004, ceil:0.10, ready:false
+};
+async function initMic(){
+  const stream = await navigator.mediaDevices.getUserMedia({audio:{
+    echoCancellation:false, noiseSuppression:false, autoGainControl:false
+  }});
+  mic.ctx = new (window.AudioContext||window.webkitAudioContext)();
+  const src = mic.ctx.createMediaStreamSource(stream);
+  mic.analyser = mic.ctx.createAnalyser();
+  mic.analyser.fftSize = 1024;
+  mic.analyser.smoothingTimeConstant = 0;
+  src.connect(mic.analyser);
+  mic.buf = new Float32Array(mic.analyser.fftSize);
+  mic.ok = true;
+}
+function readRMS(){
+  if(!mic.ok) return 0;
+  mic.analyser.getFloatTimeDomainData(mic.buf);
+  let sum=0;
+  for (let i=0;i<mic.buf.length;i++) sum += mic.buf[i]*mic.buf[i];
+  return Math.sqrt(sum/mic.buf.length);
+}
+
+let keySpace=false, keyL=false, keyR=false;
+addEventListener("keydown", e=>{
+  if(e.code==="Space"){keySpace=true; e.preventDefault();}
+  if(e.code==="ArrowLeft"||e.code==="KeyA")keyL=true;
+  if(e.code==="ArrowRight"||e.code==="KeyD")keyR=true;
+  if(e.code==="KeyR" && game.mode==="race") resetRun();
+});
+addEventListener("keyup", e=>{
+  if(e.code==="Space")keySpace=false;
+  if(e.code==="ArrowLeft"||e.code==="KeyA")keyL=false;
+  if(e.code==="ArrowRight"||e.code==="KeyD")keyR=false;
+});
+
+/* ============================================================
+   ゲーム状態
+   ============================================================ */
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const ui = document.getElementById("ui");
+const W = cv.width, H = cv.height;
+const VIEW = {ox:0, oy:56, scale:1};   // 盤面の描画オフセット(上に HUD 帯)
+
+const game = {
+  mode: "title",        // title | calFloor | calVoice | ready | race
+  useMic: false,
+  throttle: 0, thTarget: 0,
+  car: newCar(),
+  t: 0, running:false,
+  lap: 0, best: null, last: null,
+  sparks: [], skid: 0,
+  calSamples: [], calT: 0,
+  deflate: 0,           // 紙風船のしぼみ(見た目だけ。ルールに一切影響しない)
+  hitFlash: 0, hitMsg: 0,
+};
+
+function resetRun(){
+  game.car = newCar();
+  game.t = 0; game.running=false; game.lap=0;
+  game.sparks.length=0; game.deflate=0; game.hitFlash=0;
+}
+
+/* ---------- 画面(HTML オーバーレイ) ---------- */
+function showPanel(html){ ui.innerHTML = `<div class="panel">${html}</div>`; }
+function hidePanel(){ ui.innerHTML = ""; }
+
+function screenTitle(){
+  game.mode="title";
+  showPanel(`
+    <h1>息継ぎのコーナー</h1>
+    <div class="sub">ブレーキは黙ることだけ</div>
+    <p>声を出している間だけアクセルが踏まれます。<b>声量がそのままスロットル開度</b>です。<br>
+    ブレーキはありません。<b>減速したければ黙る</b>しかない。</p>
+    <p style="color:#c2a87e;font-size:13px">
+    速度は開度に対して強く非線形です。小声の巡航では上の速度域に届きません。<br>
+    直線で吐ききり、コーナーの手前で黙って息を吸う ── それが最速線です。</p>
+    <button id="bMic">マイクを使う(キャリブレーションへ)</button><br>
+    <button id="bKey" class="ghost">マイクなしで動作確認する</button>
+  `);
+  document.getElementById("bMic").onclick = async ()=>{
+    try { await initMic(); game.useMic=true; startCal(); }
+    catch(e){ game.useMic=false; screenDenied(String(e && e.name || e)); }
+  };
+  document.getElementById("bKey").onclick = ()=>{ game.useMic=false; startReady(); };
+}
+
+function screenDenied(why){
+  showPanel(`
+    <h1>マイクが使えません</h1>
+    <div class="sub">${why}</div>
+    <div class="warn">スペースキーで代用します。<br>
+    <b>これは動作確認用であり、遊びではありません。</b><br>
+    押しっぱなしにできてしまうため、このゲームの中身(息が続かないこと)は再現されません。</div>
+    <button id="bKey2">それでも動作確認する</button>
+    <button id="bRetry" class="ghost">もう一度マイクを試す</button>
+  `);
+  document.getElementById("bKey2").onclick = ()=>{ game.useMic=false; startReady(); };
+  document.getElementById("bRetry").onclick = ()=> screenTitle();
+}
+
+function startCal(){
+  game.mode="calFloor"; game.calSamples=[]; game.calT=0;
+  showPanel(`
+    <h1>キャリブレーション 1 / 2</h1>
+    <div class="sub">床(無音)を測ります</div>
+    <p><b>3秒間、黙っていてください。</b></p>
+    <div class="big" id="cnt">3.0</div>
+    <div class="meter"><i id="mtr"></i></div>
+  `);
+}
+function startCalVoice(){
+  game.mode="calVoice"; game.calSamples=[]; game.calT=0;
+  showPanel(`
+    <h1>キャリブレーション 2 / 2</h1>
+    <div class="sub">天井(全開)を測ります</div>
+    <p><b>3秒間、出せるだけの声を出してください。</b><br>
+    <span style="color:#c2a87e;font-size:13px">ここで出した声量が開度 1.0 になります</span></p>
+    <div class="big" id="cnt">3.0</div>
+    <div class="meter"><i id="mtr"></i></div>
+  `);
+}
+function calFail(){
+  showPanel(`
+    <h1>差が取れませんでした</h1>
+    <p>無音時と発声時の音量差がほとんどありません。<br>
+    マイクが拾えていないか、入力が自動で圧縮されている可能性があります。</p>
+    <button id="bAgain">やり直す</button>
+    <button id="bKey3" class="ghost">スペースキーで動作確認する</button>
+  `);
+  document.getElementById("bAgain").onclick = ()=> startCal();
+  document.getElementById("bKey3").onclick = ()=>{ game.useMic=false; startReady(); };
+}
+
+function startReady(){
+  game.mode="ready"; resetRun();
+  const fb = game.useMic ? "" : `<div class="warn">マイクを使っていません。スペースキーはアクセルです。<br>
+    <b>これは動作確認用であり、遊びではありません。</b></div>`;
+  showPanel(`
+    <h1>走る</h1>
+    <div class="sub">1周のタイムアタック</div>
+    <p><b>声</b> = アクセル / <b>黙る</b> = 減速 / <b>← →</b> または <b>A D</b> = 操舵<br>
+    スタートラインを越えるとタイムが出ます。<b>R</b> でやり直し。</p>
+    <p style="color:#c2a87e;font-size:13px">壁に擦ると火花が散って大きく失速します。<br>
+    小声で流し続けるより、直線で出しきってコーナーで黙る方が確実に速い。</p>
+    ${fb}
+    <button id="bGo">スタート</button>
+  `);
+  document.getElementById("bGo").onclick = ()=>{ game.mode="race"; hidePanel(); };
+}
+
+/* ============================================================
+   描画
+   ============================================================ */
+function pathCenterline(){
+  ctx.beginPath();
+  ctx.moveTo(CL[0][0], CL[0][1]);
+  for (let i=1;i<N;i++) ctx.lineTo(CL[i][0], CL[i][1]);
+  ctx.closePath();
+}
+
+// 机の木目(一度だけオフスクリーンに焼く)
+const deskCv = document.createElement("canvas");
+deskCv.width=W; deskCv.height=H;
+(function bakeDesk(){
+  const g = deskCv.getContext("2d");
+  g.fillStyle="#3b2a1b"; g.fillRect(0,0,W,H);
+  for (let i=0;i<160;i++){
+    const y = (i*H/160);
+    g.strokeStyle = `rgba(${90+((i*37)%40)},${64+((i*17)%26)},${38+((i*53)%20)},0.5)`;
+    g.lineWidth = 1+((i*13)%4);
+    g.beginPath();
+    for (let x=0;x<=W;x+=40){
+      g.lineTo(x, y + Math.sin(x*0.006 + i*1.7)*7 + Math.sin(x*0.021+i)*2.5);
+    }
+    g.stroke();
+  }
+  g.fillStyle="rgba(0,0,0,0.28)";
+  const rg=g.createRadialGradient(W/2,H/2,H*0.3,W/2,H/2,H*0.95);
+  rg.addColorStop(0,"rgba(0,0,0,0)"); rg.addColorStop(1,"rgba(0,0,0,0.55)");
+  g.fillStyle=rg; g.fillRect(0,0,W,H);
+})();
+
+// 壁の積み木・消しゴムの配置(一度だけ計算)
+const BLOCKS = (function(){
+  const out=[];
+  for (let i=0;i<N;i+=11){
+    const a=CL[i], b=CL[(i+2)%N];
+    const dx=b[0]-a[0], dy=b[1]-a[1], L=Math.hypot(dx,dy)||1;
+    const nx=-dy/L, ny=dx/L;
+    for (const side of [1,-1]){
+      const off = HALFW+17;
+      const x=a[0]+nx*side*off, y=a[1]+ny*side*off;
+      if (nearest(x,y).d < HALFW+4) continue;      // 内側に潜った点は捨てる
+      const kind=(i*7+ (side>0?3:0))%5;
+      out.push({x,y,ang:Math.atan2(dy,dx),kind,
+                w: kind<3 ? 34+((i*11)%16) : 26+((i*5)%10),
+                h: kind<3 ? 22 : 17});
+    }
+  }
+  return out;
+})();
+const BLOCK_COLORS = ["#c8543f","#3f7fc8","#d8ad3c","#e9e2d2","#f2b8c6"];
+
+// 背景 + コースも一度だけ焼く
+const trackCv = document.createElement("canvas");
+trackCv.width=W; trackCv.height=H;
+(function bakeTrack(){
+  const g=trackCv.getContext("2d");
+  g.drawImage(deskCv,0,0);
+  g.lineJoin="round"; g.lineCap="round";
+
+  // 影
+  g.save(); g.translate(5,8);
+  g.strokeStyle="rgba(0,0,0,0.45)"; g.lineWidth=(HALFW+20)*2;
+  pathCenterlineOn(g); g.stroke(); g.restore();
+
+  // 壁の帯(積み木の土台)
+  g.strokeStyle="#5d452c"; g.lineWidth=(HALFW+18)*2;
+  pathCenterlineOn(g); g.stroke();
+
+  // 走行面(紙)
+  g.strokeStyle="#e8dcc2"; g.lineWidth=HALFW*2;
+  pathCenterlineOn(g); g.stroke();
+  g.strokeStyle="rgba(160,140,110,0.35)"; g.lineWidth=HALFW*2-6;
+  pathCenterlineOn(g); g.stroke();
+  g.strokeStyle="#efe5cf"; g.lineWidth=HALFW*2-14;
+  pathCenterlineOn(g); g.stroke();
+
+  // 積み木・消しゴム
+  for (const b of BLOCKS){
+    g.save(); g.translate(b.x,b.y); g.rotate(b.ang);
+    g.fillStyle="rgba(0,0,0,0.35)";
+    g.fillRect(-b.w/2+3, -b.h/2+4, b.w, b.h);
+    g.fillStyle=BLOCK_COLORS[b.kind];
+    g.fillRect(-b.w/2, -b.h/2, b.w, b.h);
+    g.fillStyle="rgba(255,255,255,0.22)";
+    g.fillRect(-b.w/2, -b.h/2, b.w, b.h*0.34);
+    g.strokeStyle="rgba(0,0,0,0.30)"; g.lineWidth=1.5;
+    g.strokeRect(-b.w/2, -b.h/2, b.w, b.h);
+    g.restore();
+  }
+
+  // 中心線の破線
+  g.setLineDash([16,22]); g.strokeStyle="rgba(150,128,96,0.45)"; g.lineWidth=3;
+  pathCenterlineOn(g); g.stroke(); g.setLineDash([]);
+
+  // スタートライン
+  const a=CL[0], b=CL[4];
+  const dx=b[0]-a[0], dy=b[1]-a[1], L=Math.hypot(dx,dy)||1;
+  const nx=-dy/L, ny=dx/L;
+  g.save();
+  g.translate(a[0],a[1]); g.rotate(Math.atan2(dy,dx));
+  for (let i=0;i<8;i++) for(let j=0;j<2;j++){
+    g.fillStyle = ((i+j)%2) ? "#2a2016" : "#f6efe0";
+    g.fillRect(j*11-11, -HALFW + i*(HALFW*2/8), 11, HALFW*2/8);
+  }
+  g.restore();
+})();
+function pathCenterlineOn(g){
+  g.beginPath(); g.moveTo(CL[0][0],CL[0][1]);
+  for(let i=1;i<N;i++) g.lineTo(CL[i][0],CL[i][1]);
+  g.closePath();
+}
+
+function drawBalloon(g, car, throttle){
+  const puff = 0.62 + throttle*0.38;                    // 声で膨らむ
+  const wrinkle = 1 - game.deflate*0.18;                // しぼみ(見た目だけ)
+  const R = 15.5*puff*wrinkle;
+  g.save();
+  g.translate(car.x, car.y); g.rotate(car.heading);
+  // 影
+  g.fillStyle="rgba(0,0,0,0.35)";
+  g.beginPath(); g.ellipse(3,5,R*1.05,R*0.85,0,0,7); g.fill();
+  // 紙風船の面(色紙の折り面)
+  const faces=[["#f4655f",0],["#f7c845",1],["#5fb0e8",2],["#f2f0e6",3]];
+  for (const [col,k] of faces){
+    const a0=k*Math.PI/2 - Math.PI/4, a1=a0+Math.PI/2;
+    g.fillStyle=col;
+    g.beginPath(); g.moveTo(0,0);
+    for(let t=0;t<=1.001;t+=0.25){
+      const a=a0+(a1-a0)*t;
+      const rr=R*(1 - 0.13*Math.abs(Math.sin((a-a0)*2)));
+      g.lineTo(Math.cos(a)*rr*1.12, Math.sin(a)*rr*0.92);
+    }
+    g.closePath(); g.fill();
+  }
+  g.strokeStyle="rgba(60,40,30,0.55)"; g.lineWidth=1.4;
+  g.beginPath(); g.ellipse(0,0,R*1.12,R*0.92,0,0,7); g.stroke();
+  // 吹き口(進行方向)
+  g.fillStyle="rgba(255,255,255,0.85)";
+  g.beginPath(); g.arc(R*0.95,0,2.6+throttle*2.2,0,7); g.fill();
+  g.restore();
+}
+
+function fmt(t){
+  if(t==null) return "--.---";
+  return t.toFixed(3);
+}
+
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  ctx.save();
+  ctx.translate(VIEW.ox, VIEW.oy);
+  ctx.drawImage(trackCv,0,0);
+
+  // 息の軌跡(スロットルが開いているほど濃い)
+  const car=game.car;
+
+  // 火花
+  for (const p of game.sparks){
+    const a=p.life/p.max;
+    ctx.globalAlpha=a;
+    ctx.fillStyle = p.c;
+    ctx.beginPath(); ctx.arc(p.x,p.y,p.r*(0.4+a*0.8),0,7); ctx.fill();
+  }
+  ctx.globalAlpha=1;
+
+  drawBalloon(ctx, car, game.throttle);
+
+  // 「この先のコーナー」ゴースト表示 — 曲がれない区間を赤く光らせる
+  {
+    let warn=null;
+    for (let dd=0; dd<=900; dd+=20){
+      const i=(car.idx+Math.round(dd/SPACING))%N;
+      if (car.v > VLIM[i] && brakeDist(car.v, VLIM[i])+20 >= dd){ warn=i; break; }
+    }
+    if (warn!==null){
+      ctx.save();
+      ctx.globalAlpha=0.30+0.18*Math.sin(performance.now()/90);
+      ctx.strokeStyle="#ff5a3c"; ctx.lineWidth=HALFW*2; ctx.lineCap="round";
+      ctx.beginPath();
+      for(let j=-14;j<=14;j++){ const p=CL[(warn+j+N)%N]; ctx.lineTo(p[0],p[1]); }
+      ctx.stroke(); ctx.restore();
+    }
+  }
+  ctx.restore();
+
+  drawHUD();
+}
+
+function drawHUD(){
+  // 上帯
+  ctx.fillStyle="#120d09"; ctx.fillRect(0,0,W,VIEW.oy);
+  ctx.fillStyle="rgba(255,255,255,0.06)"; ctx.fillRect(0,VIEW.oy-2,W,2);
+
+  // --- スロットル開度バー(常時表示) ---
+  const bx=22, by=13, bw=560, bh=26;
+  ctx.fillStyle="#000"; ctx.fillRect(bx,by,bw,bh);
+  const g=ctx.createLinearGradient(bx,0,bx+bw,0);
+  g.addColorStop(0,"#4e8f47"); g.addColorStop(0.55,"#e0c246"); g.addColorStop(1,"#e2542c");
+  ctx.fillStyle=g; ctx.fillRect(bx,by,bw*game.throttle,bh);
+  // 「ここから下は推力が摩擦に負ける」死に領域
+  const dead = Math.pow(PHYS.C/PHYS.A, 1/PHYS.GAMMA);
+  ctx.fillStyle="rgba(255,255,255,0.10)"; ctx.fillRect(bx,by,bw*dead,bh);
+  ctx.strokeStyle="rgba(255,255,255,0.55)"; ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.moveTo(bx+bw*dead,by); ctx.lineTo(bx+bw*dead,by+bh); ctx.stroke();
+  ctx.strokeStyle="#7a6244"; ctx.lineWidth=2; ctx.strokeRect(bx,by,bw,bh);
+  ctx.fillStyle="#e8d8b8"; ctx.font="13px sans-serif"; ctx.textBaseline="middle";
+  ctx.fillText("スロットル開度(声量) — 白線より左は推力が摩擦に負けて進まない", bx, by+bh+13);
+
+  // --- 速度バー ---
+  const sx=640, sw=380;
+  ctx.fillStyle="#000"; ctx.fillRect(sx,by,sw,bh);
+  const vfrac=Math.min(1, game.car.v/VMAX);
+  ctx.fillStyle="#7fb3d8"; ctx.fillRect(sx,by,sw*vfrac,bh);
+  // この先のコーナーで曲がれる上限
+  let vlimAhead=VMAX*2;
+  for(let dd=0;dd<=800;dd+=20){
+    const i=(game.car.idx+Math.round(dd/SPACING))%N;
+    vlimAhead=Math.min(vlimAhead, VLIM[i]);
+  }
+  if (vlimAhead < VMAX){
+    const lx = sx + sw*Math.min(1,vlimAhead/VMAX);
+    ctx.strokeStyle="#ff6b45"; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.moveTo(lx,by-3); ctx.lineTo(lx,by+bh+3); ctx.stroke();
+  }
+  ctx.strokeStyle="#7a6244"; ctx.lineWidth=2; ctx.strokeRect(sx,by,sw,bh);
+  ctx.fillStyle="#cfe0ee"; ctx.font="13px sans-serif";
+  ctx.fillText("速度 / 赤線=この先のコーナー上限", sx, by+bh+13);
+
+  // --- タイム ---
+  ctx.font="bold 30px monospace"; ctx.fillStyle="#ffe9c4"; ctx.textAlign="right";
+  ctx.fillText(fmt(game.running||game.t>0 ? game.t : 0), W-24, by+13);
+  ctx.font="14px monospace"; ctx.fillStyle="#b79f7c";
+  ctx.fillText("BEST "+fmt(game.best)+"   LAST "+fmt(game.last), W-24, by+bh+11);
+  ctx.textAlign="left"; ctx.textBaseline="alphabetic";
+
+  // --- 状態メッセージ ---
+  if (game.hitMsg>0){
+    ctx.save();
+    ctx.globalAlpha=Math.min(1,game.hitMsg);
+    ctx.font="bold 40px sans-serif"; ctx.textAlign="center";
+    ctx.fillStyle="#ff7a4a";
+    ctx.fillText("擦った!", W/2, VIEW.oy+90);
+    ctx.restore(); ctx.textAlign="left";
+  }
+  if (game.mode==="race" && !game.running && game.t===0){
+    ctx.save(); ctx.font="22px sans-serif"; ctx.textAlign="center";
+    ctx.fillStyle="rgba(255,233,196,"+(0.55+0.35*Math.sin(performance.now()/300))+")";
+    ctx.fillText(game.useMic?"声を出すと発進します":"スペースキーで発進します", W/2, H-34);
+    ctx.restore(); ctx.textAlign="left";
+  }
+  // 壁接触フラッシュ
+  if (game.hitFlash>0){
+    ctx.fillStyle="rgba(255,90,50,"+(game.hitFlash*0.30)+")";
+    ctx.fillRect(0,VIEW.oy,W,H-VIEW.oy);
+  }
+  // フォールバック警告(常時)
+  if (!game.useMic && game.mode==="race"){
+    ctx.save();
+    ctx.fillStyle="rgba(74,31,20,0.92)"; ctx.fillRect(W-430, H-46, 410, 34);
+    ctx.strokeStyle="#c25a34"; ctx.strokeRect(W-430, H-46, 410, 34);
+    ctx.fillStyle="#ffcdb8"; ctx.font="14px sans-serif";
+    ctx.fillText("スペースキー入力 — 動作確認用であり遊びではありません", W-418, H-24);
+    ctx.restore();
+  }
+}
+
+/* ============================================================
+   ループ
+   ============================================================ */
+function updateThrottle(dt){
+  let target;
+  if (game.useMic && mic.ok){
+    mic.rms = readRMS();
+    target = (mic.rms - mic.floor)/Math.max(1e-6, mic.ceil-mic.floor);
+  } else {
+    target = keySpace ? 1 : 0;
+  }
+  target = target<0?0:target>1?1:target;
+  game.thTarget = target;
+  // アタック速く、リリースはやや遅い(息が切れた瞬間に即0にはしない)
+  const tau = target>game.throttle ? 0.045 : 0.075;
+  const a = 1-Math.exp(-dt/tau);
+  game.throttle += (target-game.throttle)*a;
+}
+
+function spawnSparks(x,y,n){
+  for (let i=0;i<n;i++){
+    const a=Math.random()*Math.PI*2, sp=60+Math.random()*260;
+    game.sparks.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,
+      r:1.2+Math.random()*2.4, life:0.35+Math.random()*0.45,
+      max:0.8, c: Math.random()<0.5 ? "#ffd36b" : "#ff8a3c"});
+  }
+}
+
+let prev=performance.now();
+function loop(now){
+  let dt=(now-prev)/1000; prev=now;
+  if (dt>0.05) dt=0.05;
+
+  if (game.mode==="calFloor" || game.mode==="calVoice"){
+    const r = readRMS();
+    game.calSamples.push(r);
+    game.calT += dt;
+    const el=document.getElementById("cnt");
+    if(el) el.textContent = Math.max(0,3-game.calT).toFixed(1);
+    const m=document.getElementById("mtr");
+    if(m) m.style.width = Math.min(100, r*900).toFixed(1)+"%";
+    if (game.calT>=3){
+      const s = game.calSamples.slice().sort((a,b)=>a-b);
+      const pick = p => s[Math.min(s.length-1, Math.floor(s.length*p))];
+      if (game.mode==="calFloor"){ mic.floor = pick(0.80)*1.15 + 0.0008; startCalVoice(); }
+      else {
+        mic.ceil = pick(0.60);
+        if (mic.ceil - mic.floor < 0.004) calFail();
+        else { mic.ready=true; startReady(); }
+      }
+    }
+  }
+
+  if (game.mode==="race"){
+    updateThrottle(dt);
+    const steer = (keyR?1:0) - (keyL?1:0);
+    if (!game.running && game.car.v>1.0) game.running=true;
+    if (game.running) game.t += dt;
+
+    const sub = 3, sdt = dt/sub;
+    for (let k=0;k<sub;k++){
+      stepCar(game.car, game.throttle, steer, sdt);
+      if (game.car.hit){
+        spawnSparks(game.car.hitX, game.car.hitY, 7);
+        game.hitFlash = 1; game.hitMsg = 1.1;
+      }
+    }
+    // 紙風船のしぼみ(見た目のみ / ルールに影響しない)
+    game.deflate = Math.min(1, game.deflate + dt*0.045 - game.throttle*dt*0.09);
+    if (game.deflate<0) game.deflate=0;
+
+    if (game.car.prog >= N){
+      game.last = game.t;
+      if (game.best==null || game.t<game.best) game.best=game.t;
+      game.car.prog -= N;
+      game.t = 0;
+      game.deflate = 0;
+    }
+  } else {
+    updateThrottle(dt);
+  }
+
+  game.hitFlash = Math.max(0, game.hitFlash - dt*3.2);
+  game.hitMsg   = Math.max(0, game.hitMsg   - dt*1.1);
+  for (let i=game.sparks.length-1;i>=0;i--){
+    const p=game.sparks[i];
+    p.x+=p.vx*dt; p.y+=p.vy*dt; p.vy+=420*dt; p.vx*=0.94; p.vy*=0.94;
+    p.life-=dt;
+    if(p.life<=0) game.sparks.splice(i,1);
+  }
+
+  draw();
+  requestAnimationFrame(loop);
+}
+
+screenTitle();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
