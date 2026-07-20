@@ -8,7 +8,7 @@
   html,body{margin:0;height:100%;background:#15100c;color:#f2e6d2;
     font-family:"Hiragino Kaku Gothic ProN","Noto Sans JP",system-ui,sans-serif;overflow:hidden}
   #wrap{position:relative;width:100vw;height:100vh;display:flex;align-items:center;justify-content:center}
-  canvas{max-width:100%;max-height:100%;image-rendering:auto;box-shadow:0 0 60px #000a}
+  canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
   #ui{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
     pointer-events:none}
   .panel{pointer-events:auto;background:#1c1611ee;border:1px solid #6b563a;border-radius:14px;
@@ -52,7 +52,12 @@ const PHYS = {
   ALAT: 520,     // 最大横加速度(速いほど曲がれない)
   OMEGA_MAX: 3.3,
   CAR_R: 11,
-  HIT: 0.30,     // 壁接触時の速度倍率
+  SCRUB: 1.4,       // 擦っている間の基礎減衰 [1/s]
+  BITE: 14,         // 壁への突っ込み角に比例する減衰 [1/s]
+  WALL_TURN: 2.0,   // 壁に沿わされる回頭速度の上限 [rad/s]
+  WALL_CAP: 110,    // 壁に触れている間の速度上限。
+                    // 「触れたら這うしかない」を保証し、擦りながら曲がる
+                    // 戦法(壁を無料のブレーキ兼ステアリングにする)を潰す
 };
 // 終端速度 v(t) = (A*t^GAMMA - C)/K   →  v(1)=420, v(0.7)=127, v(0.5)=10
 function terminalSpeed(t){ return Math.max(0,(PHYS.A*Math.pow(t,PHYS.GAMMA)-PHYS.C)/PHYS.K); }
@@ -175,12 +180,30 @@ function stepCar(s, throttle, steer, dt){
   // 壁 —— 中心線からの距離で判定(描画の帯と厳密に一致する)
   const nr = nearest(s.x, s.y);
   const lim = HALFW - PHYS.CAR_R;
-  s.hit = false;
+  s.hit = false; s.scrape = false;
   if (nr.d > lim){
-    const ux=(s.x-nr.px)/(nr.d||1), uy=(s.y-nr.py)/(nr.d||1);
+    const ux=(s.x-nr.px)/(nr.d||1), uy=(s.y-nr.py)/(nr.d||1);   // 外向き法線
     s.x = nr.px+ux*lim; s.y = nr.py+uy*lim;
-    s.v *= PHYS.HIT;
-    s.hit = true; s.hitX=nr.px+ux*HALFW; s.hitY=nr.py+uy*HALFW;
+    const hx=Math.cos(s.heading), hy=Math.sin(s.heading);
+    const inc = hx*ux + hy*uy;                 // >0 なら壁へ突っ込んでいる
+    let bite = 0;
+    if (inc > 0){
+      // 壁面へ「ゆっくり」沿わされる。一瞬で向きが揃うと壁が無料の
+      // ステアリングになり、擦りながら曲がるのが最速になってしまう。
+      const sg = (-hx*uy + hy*ux) >= 0 ? 1 : -1;
+      const tang = Math.atan2(ux*sg, -uy*sg);
+      let dh = tang - s.heading;
+      while (dh> Math.PI) dh-=2*Math.PI;
+      while (dh<-Math.PI) dh+=2*Math.PI;
+      const mx = PHYS.WALL_TURN*dt;
+      s.heading += dh<-mx?-mx:dh>mx?mx:dh;
+      bite = PHYS.BITE*inc;                     // 正面から刺さるほど大きく失う
+      s.hit = true;
+    }
+    s.v *= Math.exp(-(PHYS.SCRUB + bite)*dt);   // 擦っている間ずっと削られる
+    if (s.v > PHYS.WALL_CAP) s.v = PHYS.WALL_CAP;
+    s.scrape = true;
+    s.hitX=nr.px+ux*HALFW; s.hitY=nr.py+uy*HALFW;
   }
   // 周回進捗(インデックス差の累積。逆走すると減る)
   let d = nr.i - s.lastIdx;
@@ -570,21 +593,10 @@ function draw(){
   ctx.translate(VIEW.ox, VIEW.oy);
   ctx.drawImage(trackCv,0,0);
 
-  // 息の軌跡(スロットルが開いているほど濃い)
   const car=game.car;
 
-  // 火花
-  for (const p of game.sparks){
-    const a=p.life/p.max;
-    ctx.globalAlpha=a;
-    ctx.fillStyle = p.c;
-    ctx.beginPath(); ctx.arc(p.x,p.y,p.r*(0.4+a*0.8),0,7); ctx.fill();
-  }
-  ctx.globalAlpha=1;
-
-  drawBalloon(ctx, car, game.throttle);
-
-  // 「この先のコーナー」ゴースト表示 — 曲がれない区間を赤く光らせる
+  // 「この先のコーナー」表示 — いま黙らないと曲がれない区間を赤く光らせる
+  // (自機より先に描く。上に被せると肝心の自機が見えなくなる)
   {
     let warn=null;
     for (let dd=0; dd<=900; dd+=20){
@@ -600,6 +612,17 @@ function draw(){
       ctx.stroke(); ctx.restore();
     }
   }
+
+  // 火花
+  for (const p of game.sparks){
+    const a=p.life/p.max;
+    ctx.globalAlpha=a;
+    ctx.fillStyle = p.c;
+    ctx.beginPath(); ctx.arc(p.x,p.y,p.r*(0.4+a*0.8),0,7); ctx.fill();
+  }
+  ctx.globalAlpha=1;
+
+  drawBalloon(ctx, car, game.throttle);
   ctx.restore();
 
   drawHUD();
@@ -745,9 +768,13 @@ function loop(now){
     const sub = 3, sdt = dt/sub;
     for (let k=0;k<sub;k++){
       stepCar(game.car, game.throttle, steer, sdt);
-      if (game.car.hit){
-        spawnSparks(game.car.hitX, game.car.hitY, 7);
+      if (game.car.hit){                       // 壁へ突っ込んだ瞬間
+        spawnSparks(game.car.hitX, game.car.hitY, 9);
         game.hitFlash = 1; game.hitMsg = 1.1;
+      } else if (game.car.scrape && game.car.v > 30){   // 擦り続けている間
+        spawnSparks(game.car.hitX, game.car.hitY, 2);
+        game.hitFlash = Math.max(game.hitFlash, 0.45);
+        game.hitMsg = Math.max(game.hitMsg, 0.7);
       }
     }
     // 紙風船のしぼみ(見た目のみ / ルールに影響しない)
